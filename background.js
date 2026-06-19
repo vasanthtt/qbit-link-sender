@@ -72,10 +72,7 @@ async function login(host, username, password) {
       body: urlAuthParams,
     });
 
-    // The API returns 'Ok.' on success, 'Failed.' on failure, and sets a 'SID' cookie.
-    const responseText = await response.text();
-
-    if (responseText.includes("Ok.")) {
+    if (response.status === 200) {
       // Retrieve the session cookie from the response headers (this is tricky for a Service Worker)
       // For a Chrome Service Worker, we can't directly read the 'Set-Cookie' header
       // in the 'fetch' response due to security restrictions.
@@ -94,6 +91,7 @@ async function login(host, username, password) {
       qbitSessionCookie = "DUMMY_OK"; // Mark as "logged in" state
       return true;
     } else {
+      const responseText = await response.text();
       console.error("qBittorrent Login Failed:", responseText);
       return false;
     }
@@ -123,12 +121,10 @@ async function addTorrent(host, linkUrl) {
       body: formData, // Using FormData automatically sets the correct 'Content-Type: multipart/form-data'
     });
 
-    const responseText = await response.text();
-
-    // The qBittorrent API returns 'Ok.' on success, and 'Fails' or 'Invalid URL' on error.
-    if (responseText.includes("Ok.")) {
+    if (response.status === 200) {
       return true;
     } else {
+      const responseText = await response.text();
       throw new Error(`qBittorrent API Error: ${responseText}`);
     }
   } catch (error) {
