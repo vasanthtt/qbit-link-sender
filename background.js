@@ -5,6 +5,12 @@
 let qbitSessionCookie = null;
 const browser = globalThis.browser || globalThis.chrome;
 
+browser.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "clear_qbit_badge") {
+    browser.action.setBadgeText({ text: "" });
+  }
+});
+
 // --- Context Menu Creation ---
 // Runs when the extension is installed/updated.
 browser.runtime.onInstalled.addListener(() => {
@@ -24,15 +30,55 @@ browser.runtime.onInstalled.addListener(() => {
 
 // --- API Utility Functions ---
 async function notify(title, message) {
+  // Use a consistent ID for Brave/Chrome compatibility (auto-replace if exists)
+  const notificationId = "qbit-notification";
+  const options = {
+    type: "basic",
+    iconUrl: browser.runtime.getURL("icon48.png"),
+    title,
+    message,
+    priority: 2,
+    requireInteraction: false,
+  };
+
   try {
-    browser.notifications.create({
-      type: "basic",
-      iconUrl: "icon48.png",
-      title: title,
-      message: message,
-    });
+    if (!browser.notifications || typeof browser.notifications.create !== "function") {
+      throw new Error("notifications API unavailable");
+    }
+
+    // Firefox-style APIs return a Promise; Chrome/Brave-style APIs use a callback.
+    if (globalThis.browser && browser === globalThis.browser) {
+      const createdId = await browser.notifications.create(notificationId, options);
+      if (!createdId) {
+        throw new Error("notifications.create returned an empty id");
+      }
+    } else {
+      // Chrome/Brave style with callback
+      return await new Promise((resolve, reject) => {
+        try {
+          browser.notifications.create(notificationId, options, (createdId) => {
+            const lastError = browser.runtime && browser.runtime.lastError;
+            if (lastError) {
+              console.error("Chrome notification error:", lastError);
+              reject(new Error(lastError.message));
+              return;
+            }
+            console.log("Notification created with ID:", createdId);
+            resolve(true);
+          });
+        } catch (error) {
+          console.error("Notification creation exception:", error);
+          reject(error);
+        }
+      });
+    }
+    return true;
   } catch (error) {
-    console.error("alert failed:", error);
+    console.error("Notification failed, using badge/title fallback:", error);
+    browser.action.setBadgeBackgroundColor({ color: "#dc3545" });
+    browser.action.setBadgeText({ text: "!" });
+    browser.action.setTitle({ title: `${title} - ${message}` });
+    browser.alarms.create("clear_qbit_badge", { delayInMinutes: 0.2 });
     return false;
   }
 }
@@ -72,7 +118,7 @@ async function login(host, username, password) {
       body: urlAuthParams,
     });
 
-    if (response.status === 200) {
+    if (response.status === 204) {
       // Retrieve the session cookie from the response headers (this is tricky for a Service Worker)
       // For a Chrome Service Worker, we can't directly read the 'Set-Cookie' header
       // in the 'fetch' response due to security restrictions.
@@ -111,24 +157,101 @@ async function addTorrent(host, linkUrl) {
   // API to add links: /api/v2/torrents/add
   const addUrl = `${host}/api/v2/torrents/add`;
 
-  // The API expects a POST request, with the URL(s) in the 'urls' field of the form data.
-  const formData = new FormData();
+  // Use URLSearchParams for better compatibility with qBittorrent API
+  const formData = new URLSearchParams();
   formData.append("urls", linkUrl);
+  // These parameters help ensure the torrent is actually added
+  formData.append("skip_checking", "false");
+  formData.append("paused", "false");
+  // Note: We intentionally don't set savepath - let qBittorrent use its default
 
   try {
     const response = await fetch(addUrl, {
       method: "POST",
-      body: formData, // Using FormData automatically sets the correct 'Content-Type: multipart/form-data'
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: formData.toString(),
+      credentials: "include", // Include cookies for authentication
     });
 
-    if (response.status === 200) {
-      return true;
+    // Log the response for debugging
+    const responseText = await response.text();
+    console.log(`qBittorrent API Response (${response.status}):`, responseText);
+
+    if (response.status === 200 || response.status === 202) {
+      // Parse the response JSON to check actual success
+      try {
+        const result = JSON.parse(responseText);
+        console.log("Parsed result:", result);
+
+        // Check the actual success using the response JSON
+        if (result.success_count > 0) {
+          console.log("Torrent added successfully. Added IDs:", result.added_torrent_ids);
+          return true;
+        } else if (result.pending_count > 0 && result.failure_count === 0) {
+          // Pending means qBittorrent is processing it (e.g., downloading .torrent file)
+          console.warn("Torrent is pending processing. It should appear shortly.");
+          notify(
+            "⏳ Torrent Pending",
+            "Your torrent is being processed by qBittorrent. It will appear in a moment."
+          );
+          return true;
+        } else if (result.failure_count > 0) {
+          console.error("Torrent addition failed:", result);
+          notify(
+            "Qbit Link Sender Error",
+            `Failed to add torrent. Failures: ${result.failure_count}. Check if it's a valid magnet link or .torrent file.`
+          );
+          return false;
+        } else {
+          console.warn("Unexpected response - no success, pending, or failure:", result);
+          notify(
+            "Qbit Link Sender Warning",
+            "Unexpected response from qBittorrent. It may still be processing."
+          );
+          return true; // Assume success for now
+        }
+      } catch (parseError) {
+        console.error("Failed to parse response JSON:", parseError, "Raw response:", responseText);
+        // If we can't parse, assume success if status was 200/202
+        return true;
+      }
+    } else if (response.status === 400) {
+      console.error("Bad request (400):", responseText);
+      notify(
+        "Qbit Link Sender Error",
+        "Bad request to qBittorrent API. Invalid torrent URL? " + responseText
+      );
+      return false;
+    } else if (response.status === 403) {
+      console.error("Forbidden (403) - authentication may have failed:", responseText);
+      notify(
+        "Qbit Link Sender Error",
+        "Authentication failed. Please check your credentials in options."
+      );
+      return false;
+    } else if (response.status === 409) {
+      console.warn("Torrent already exists (409)");
+      notify(
+        "Qbit Link Sender Information",
+        "Torrent is already added to qBittorrent."
+      );
+      return false;
     } else {
-      const responseText = await response.text();
-      throw new Error(`qBittorrent API Error: ${responseText}`);
+      console.error(`qBittorrent API Error (${response.status}):`, responseText);
+      notify(
+        "Qbit Link Sender Error",
+        `qBittorrent API Error ${response.status}: ${responseText.substring(0, 100)}`
+      );
+      return false;
     }
   } catch (error) {
     console.error("Add Torrent request failed:", error);
+    notify(
+      "Qbit Link Sender Error",
+      "Network error: " + error.message
+    );
     return false;
   }
 }
